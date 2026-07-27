@@ -6,4 +6,6 @@ services:
       - "19321:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./server.py:/app/server.py:ro
+      - ./entrypoint.sh:/app/entrypoint.sh:ro
     restart: unless-stopped
